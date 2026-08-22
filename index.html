@@ -31,10 +31,82 @@
       try {
         document.getElementById('status').innerText = "Status: Searching...";
         bluetoothDevice = await navigator.bluetooth.requestDevice({
-          filters: [{ name: 'ESP32_BLE_CAR' }],
+          acceptAllDevices: true,
           optionalServices: [SERVICE_UUID]
         });
 
+        const server = await bluetoothDevice.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        rxCharacteristic = await service.getCharacteristic(CHARACTERISTIC_UUID_RX);
+
+        document.getElementById('status').innerText = "Status: Connected!";
+      } catch (error) {
+        document.getElementById('status').innerText = "Connection Failed: " + error;
+      }
+    }
+
+    const container = document.getElementById('joyContainer');
+    const knob = document.getElementById('joyKnob');
+    let rect, centerX, centerY, maxRadius = 85;
+    let active = false;
+    let lastX = 0, lastY = 0;
+
+    function handleStart(e) {
+      if (!rxCharacteristic) return;
+      active = true;
+      rect = container.getBoundingClientRect();
+      centerX = rect.width / 2;
+      centerY = rect.height / 2;
+      handleMove(e);
+    }
+
+    function handleMove(e) {
+      if (!active || !rxCharacteristic) return;
+      let touch = e.touches ? e.touches[0] : e;
+      let touchX = touch.clientX - rect.left - centerX;
+      let touchY = touch.clientY - rect.top - centerY;
+
+      let distance = Math.hypot(touchX, touchY);
+      if (distance > maxRadius) {
+        touchX = (touchX / distance) * maxRadius;
+        touchY = (touchY / distance) * maxRadius;
+      }
+
+      knob.style.transform = `translate(${touchX}px, ${touchY}px)`;
+
+      let normX = Math.round((touchX / maxRadius) * 100);
+      let normY = Math.round((-touchY / maxRadius) * 100);
+
+      if (Math.abs(normX - lastX) > 4 || Math.abs(normY - lastY) > 4) {
+        lastX = normX; lastY = normY;
+        sendBLEData(`${normX},${normY}`);
+      }
+    }
+
+    function handleEnd() {
+      if (!active) return;
+      active = false;
+      knob.style.transform = `translate(0px, 0px)`;
+      lastX = 0; lastY = 0;
+      sendBLEData("0,0");
+    }
+
+    async function sendBLEData(data) {
+      if (rxCharacteristic) {
+        let encoder = new TextEncoder();
+        await rxCharacteristic.writeValue(encoder.encode(data));
+      }
+    }
+
+    container.addEventListener('touchstart', handleStart, false);
+    container.addEventListener('touchmove', handleMove, false);
+    container.addEventListener('touchend', handleEnd, false);
+    container.addEventListener('mousedown', handleStart, false);
+    window.addEventListener('mousemove', handleMove, false);
+    window.addEventListener('mouseup', handleEnd, false);
+  </script>
+</body>
+</html>
         const server = await bluetoothDevice.gatt.connect();
         const service = await server.getPrimaryService(SERVICE_UUID);
         rxCharacteristic = await service.getCharacteristic(CHARACTERISTIC_UUID_RX);
