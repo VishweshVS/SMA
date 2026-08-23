@@ -1,40 +1,239 @@
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
-#include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>ESP32 Bluetooth Direction Controller</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      text-align: center;
+      background: #121212;
+      color: #fff;
+      margin: 0;
+      padding: 20px;
+      user-select: none;
+      touch-action: manipulation;
+    }
+    h1 { font-size: 22px; color: #00E676; margin-bottom: 5px; }
+    #status { font-size: 14px; color: #aaa; margin-bottom: 20px; }
+    
+    .connect-btn {
+      padding: 12px 28px;
+      font-size: 16px;
+      background: #00E676;
+      border: none;
+      border-radius: 8px;
+      font-weight: bold;
+      color: #000;
+      cursor: pointer;
+      margin-bottom: 25px;
+    }
 
-// Standard Nordic UART Service UUIDs
-#define SERVICE_UUID           "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-#define CHARACTERISTIC_UUID_RX "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+    /* D-Pad Controller Grid */
+    .dpad-container {
+      display: grid;
+      grid-template-columns: repeat(3, 80px);
+      grid-template-rows: repeat(3, 80px);
+      gap: 12px;
+      justify-content: center;
+      align-items: center;
+      margin: 0 auto;
+    }
 
-// L298N Motor Control Pins
-#define ENA 14
-#define IN1 18
-#define IN2 21
-#define IN3 25
-#define IN4 33
-#define ENB 12
+    .btn {
+      background: #1E1E1E;
+      border: 2px solid #333;
+      border-radius: 16px;
+      color: #00E676;
+      font-size: 24px;
+      font-weight: bold;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      cursor: pointer;
+      box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+      transition: background 0.1s, transform 0.1s;
+    }
 
-// Minimum PWM to ensure motor starts turning smoothly
-#define MIN_PWM 70 
+    .btn:active, .btn.active {
+      background: #00E676;
+      color: #121212;
+      transform: scale(0.95);
+    }
 
-BLEServer *pServer = NULL;
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
+    .btn-stop {
+      background: #D32F2F;
+      color: #fff;
+      border-color: #F44336;
+      font-size: 16px;
+    }
 
-// Motor Driver Control Function
-void setMotorSpeed(int leftSpeed, int rightSpeed) {
-  // LEFT MOTOR LOGIC (IN1 & IN2)
-  if (leftSpeed > 0) {
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
-  } else if (leftSpeed < 0) {
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, HIGH);
-    leftSpeed = -leftSpeed;
-  } else {
+    .btn-stop:active, .btn-stop.active {
+      background: #FF5252;
+      color: #fff;
+    }
+
+    /* Keymap Helper Badges */
+    .key-badge {
+      font-size: 10px;
+      display: block;
+      color: #888;
+      margin-top: 4px;
+    }
+
+    /* Position assignments in Grid */
+    #btnUp { grid-column: 2; grid-row: 1; }
+    #btnLeft { grid-column: 1; grid-row: 2; }
+    #btnStop { grid-column: 2; grid-row: 2; }
+    #btnRight { grid-column: 3; grid-row: 2; }
+    #btnDown { grid-column: 2; grid-row: 3; }
+
+    .instructions {
+      margin-top: 30px;
+      font-size: 13px;
+      color: #666;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>ESP32 Direction Controller</h1>
+  <button class="connect-btn" onclick="connectBLE()">Connect to Car</button>
+  <div id="status">Status: Disconnected</div>
+
+  <!-- Touch & On-Screen D-Pad -->
+  <div class="dpad-container">
+    <div id="btnUp" class="btn" 
+         onmousedown="sendDirection('UP')" onmouseup="sendDirection('STOP')" 
+         ontouchstart="sendDirection('UP')" ontouchend="sendDirection('STOP')">
+      ▲
+    </div>
+    <div id="btnLeft" class="btn" 
+         onmousedown="sendDirection('LEFT')" onmouseup="sendDirection('STOP')" 
+         ontouchstart="sendDirection('LEFT')" ontouchend="sendDirection('STOP')">
+      ◄
+    </div>
+    <div id="btnStop" class="btn btn-stop" onclick="sendDirection('STOP')">
+      STOP
+    </div>
+    <div id="btnRight" class="btn" 
+         onmousedown="sendDirection('RIGHT')" onmouseup="sendDirection('STOP')" 
+         ontouchstart="sendDirection('RIGHT')" ontouchend="sendDirection('STOP')">
+      ►
+    </div>
+    <div id="btnDown" class="btn" 
+         onmousedown="sendDirection('DOWN')" onmouseup="sendDirection('STOP')" 
+         ontouchstart="sendDirection('DOWN')" ontouchend="sendDirection('STOP')">
+      ▼
+    </div>
+  </div>
+
+  <div class="instructions">
+    Use <b>W A S D</b> or <b>Arrow Keys</b> on your keyboard.<br>
+    Press <b>Spacebar</b> to Stop.
+  </div>
+
+  <script>
+    const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+    const CHARACTERISTIC_UUID_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+
+    let rxCharacteristic = null;
+    let bluetoothDevice = null;
+    let activeKey = null;
+
+    // Connect to ESP32 Web Bluetooth
+    async function connectBLE() {
+      try {
+        document.getElementById('status').innerText = "Status: Searching...";
+        bluetoothDevice = await navigator.bluetooth.requestDevice({
+          acceptAllDevices: true,
+          optionalServices: [SERVICE_UUID]
+        });
+
+        const server = await bluetoothDevice.gatt.connect();
+        const service = await server.getPrimaryService(SERVICE_UUID);
+        rxCharacteristic = await service.getCharacteristic(CHARACTERISTIC_UUID_RX);
+
+        document.getElementById('status').innerText = "Status: Connected!";
+      } catch (error) {
+        document.getElementById('status').innerText = "Connection Failed: " + error;
+      }
+    }
+
+    // Direction Mapping Handler
+    function sendDirection(dir) {
+      if (!rxCharacteristic) return;
+
+      let payload = "0,0"; // Default Stop
+
+      switch (dir) {
+        case 'UP':    payload = "100,0"; break;   // Full Forward Throttle
+        case 'DOWN':  payload = "-100,0"; break;  // Full Reverse Throttle
+        case 'LEFT':  payload = "0,-100"; break;  // Turn Left
+        case 'RIGHT': payload = "0,100"; break;   // Turn Right
+        case 'STOP':  payload = "0,0"; break;     // Immediate Stop
+      }
+
+      sendBLEData(payload);
+    }
+
+    // Low-Latency BLE Streaming
+    async function sendBLEData(data) {
+      if (rxCharacteristic) {
+        try {
+          let encoder = new TextEncoder();
+          await rxCharacteristic.writeValueWithoutResponse(encoder.encode(data));
+        } catch (e) {
+          console.error("BLE Send Error:", e);
+        }
+      }
+    }
+
+    // --- KEYBOARD LISTENERS ---
+    window.addEventListener('keydown', (e) => {
+      if (e.repeat) return; // Ignore hold key repetitions
+      
+      const key = e.key.toLowerCase();
+
+      if (key === 'w' || key === 'arrowup') {
+        highlightBtn('btnUp', true);
+        sendDirection('UP');
+      } else if (key === 's' || key === 'arrowdown') {
+        highlightBtn('btnDown', true);
+        sendDirection('DOWN');
+      } else if (key === 'a' || key === 'arrowleft') {
+        highlightBtn('btnLeft', true);
+        sendDirection('LEFT');
+      } else if (key === 'd' || key === 'arrowright') {
+        highlightBtn('btnRight', true);
+        sendDirection('RIGHT');
+      } else if (key === ' ' || key === 'spacebar') {
+        highlightBtn('btnStop', true);
+        sendDirection('STOP');
+      }
+    });
+
+    window.addEventListener('keyup', (e) => {
+      const key = e.key.toLowerCase();
+      
+      if (['w', 's', 'a', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' ', 'spacebar'].includes(key)) {
+        clearHighlights();
+        sendDirection('STOP'); // Stop car when key is released
+      }
+    });
+
+    function highlightBtn(id, active) {
+      clearHighlights();
+      const el = document.getElementById(id);
+      if (el && active) el.classList.add('active');
+    }
+
+    function clearHighlights() {
+      document.querySelectorAll('.btn').forEach(btn => btn.classList.remove('active'));
+    }
+  </script>
+</body>
+</html>  } else {
     digitalWrite(IN1, LOW);
     digitalWrite(IN2, LOW);
   }
