@@ -1,40 +1,153 @@
-<!DOCTYPE html>
-<html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>ESP32 Web Bluetooth Joystick</title>
-  <style>
-    body { font-family: Arial, sans-serif; text-align: center; background: #121212; color: #fff; margin: 0; overflow: hidden; touch-action: none; }
-    h1 { margin-top: 15px; font-size: 20px; color: #00E676; }
-    .connect-btn { padding: 12px 24px; font-size: 16px; background: #00E676; border: none; border-radius: 8px; font-weight: bold; cursor: pointer; margin-bottom: 10px; }
-    #joyContainer { position: relative; width: 240px; height: 240px; background: #1E1E1E; border: 4px solid #333; border-radius: 50%; margin: 15px auto; touch-action: none; }
-    #joyKnob { position: absolute; width: 70px; height: 70px; background: #00E676; border-radius: 50%; top: 85px; left: 85px; box-shadow: 0 0 15px rgba(0,230,118,0.5); }
-    #status { font-size: 14px; color: #aaa; }
-  </style>
-</head>
-<body>
-  <h1>Web Bluetooth Joystick</h1>
-  <button class="connect-btn" onclick="connectBLE()">Connect to Car</button>
-  <div id="joyContainer">
-    <div id="joyKnob"></div>
-  </div>
-  <div id="status">Status: Disconnected</div>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
-  <script>
-    const SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
-    const CHARACTERISTIC_UUID_RX = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+// Standard Nordic UART Service UUIDs
+#define SERVICE_UUID           "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define CHARACTERISTIC_UUID_RX "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 
-    let rxCharacteristic = null;
-    let bluetoothDevice = null;
+// L298N Motor Control Pins
+#define ENA 14
+#define IN1 18
+#define IN2 21
+#define IN3 25
+#define IN4 33
+#define ENB 12
 
-    async function connectBLE() {
-      try {
-        document.getElementById('status').innerText = "Status: Searching...";
-        bluetoothDevice = await navigator.bluetooth.requestDevice({
-          acceptAllDevices: true,
-          optionalServices: [SERVICE_UUID]
-        });
+// Minimum PWM to ensure motor starts turning smoothly
+#define MIN_PWM 70 
 
+BLEServer *pServer = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+// Motor Driver Control Function
+void setMotorSpeed(int leftSpeed, int rightSpeed) {
+  // LEFT MOTOR LOGIC (IN1 & IN2)
+  if (leftSpeed > 0) {
+    digitalWrite(IN1, HIGH);
+    digitalWrite(IN2, LOW);
+  } else if (leftSpeed < 0) {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, HIGH);
+    leftSpeed = -leftSpeed;
+  } else {
+    digitalWrite(IN1, LOW);
+    digitalWrite(IN2, LOW);
+  }
+
+  // RIGHT MOTOR LOGIC (IN3 & IN4)
+  if (rightSpeed > 0) {
+    digitalWrite(IN3, HIGH);
+    digitalWrite(IN4, LOW);
+  } else if (rightSpeed < 0) {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, HIGH);
+    rightSpeed = -rightSpeed;
+  } else {
+    digitalWrite(IN3, LOW);
+    digitalWrite(IN4, LOW);
+  }
+
+  // Minimum PWM kick to overcome mechanical resistance
+  if (leftSpeed > 0 && leftSpeed < MIN_PWM) leftSpeed = MIN_PWM;
+  if (rightSpeed > 0 && rightSpeed < MIN_PWM) rightSpeed = MIN_PWM;
+
+  analogWrite(ENA, constrain(leftSpeed, 0, 255));
+  analogWrite(ENB, constrain(rightSpeed, 0, 255));
+}
+
+// BLE Callbacks
+class ServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println(">> Client Connected! <<");
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      setMotorSpeed(0, 0); 
+      Serial.println(">> Client Disconnected! <<");
+    }
+};
+
+class CharacteristicCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) {
+      String rxValue = pCharacteristic->getValue().c_str();
+      if (rxValue.length() > 0) {
+        int commaIndex = rxValue.indexOf(',');
+        if (commaIndex != -1) {
+          int rawY = rxValue.substring(0, commaIndex).toInt();
+          int rawX = rxValue.substring(commaIndex + 1).toInt();
+
+          // Invert Y so pushing North produces positive throttle
+          int throttle = -rawY; 
+          int steering = rawX;
+
+          // Differential Drive calculations
+          int leftSpeed  = (throttle - steering) * 2.55;
+          int rightSpeed = (throttle + steering) * 2.55;
+
+          // Center deadzone handling
+          if (abs(rawY) < 10 && abs(rawX) < 10) {
+            setMotorSpeed(0, 0);
+          } else {
+            setMotorSpeed(constrain(leftSpeed, -255, 255), constrain(rightSpeed, -255, 255));
+          }
+        }
+      }
+    }
+};
+
+void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout resets
+  Serial.begin(115200);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  setMotorSpeed(0, 0);
+
+  BLEDevice::init("ESP32_BLE_CAR");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(
+                                          CHARACTERISTIC_UUID_RX,
+                                          BLECharacteristic::PROPERTY_WRITE | 
+                                          BLECharacteristic::PROPERTY_WRITE_NR
+                                        );
+  pRxCharacteristic->setCallbacks(new CharacteristicCallbacks());
+
+  pService->start();
+  
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+  
+  Serial.println("==========================================");
+  Serial.println("BLE Ready! Connect using index.html");
+  Serial.println("==========================================");
+}
+
+void loop() {
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(500); 
+    pServer->startAdvertising(); 
+    oldDeviceConnected = deviceConnected;
+  }
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+  }
+  delay(10);
+}
         const server = await bluetoothDevice.gatt.connect();
         const service = await server.getPrimaryService(SERVICE_UUID);
         rxCharacteristic = await service.getCharacteristic(CHARACTERISTIC_UUID_RX);
